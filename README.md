@@ -1,4 +1,6 @@
-Usage instructions
+run these instructions within the same directory
+
+Usage instructions:
 
 1. g++ -o assembler assembler.cpp
 
@@ -18,3 +20,5 @@ Usage instructions
 -v prints out the fetch/decode/execute cycles for each instruction (use with timer to see execution cycles)
 
 All CPU registers will be printed to terminal to verify
+
+Videos for fib and recursive add tests are available within the repository.
