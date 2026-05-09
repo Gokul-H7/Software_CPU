@@ -1,140 +1,217 @@
+// ------------------------------------------------------------
+// Reduced RISC-V CPU Emulator
+//
+// Supported Instructions:
+//   add, sub
+//   addi
+//   lw, sw
+//   beq
+//   jal, jalr
+//
+// Features:
+//   - 32 general-purpose registers
+//   - byte-addressable memory
+//   - Stack support for recursion
+//   - MMIO output support
+//
+// Memory:
+//   64KB total memory
+// ------------------------------------------------------------
 #include <iostream>
-#include <vector>
 #include <fstream>
 #include <cstdint>
 #include <iomanip>
+#include <cstdlib>
 
 using namespace std;
 
-// Memory Constants
 const uint32_t MEM_SIZE = 65536;       // 64KB
-const uint32_t MMIO_PRINT = 0x8000;    // Writing here prints a char
+const uint32_t MMIO_PRINT = 1024;      // sw here prints low byte as char
 
 class RISCV_CPU {
 private:
-    uint32_t regs[32] = {0};           // Register File (x0-x31)
-    uint32_t pc = 0;                   // Program Counter
-    uint8_t memory[MEM_SIZE] = {0};    // Unified Memory
+    uint32_t regs[32] = {0};
+    uint32_t pc = 0;
+    uint8_t memory[MEM_SIZE] = {0};
     bool running = true;
 
-public:
-    RISCV_CPU() {
-        regs[0] = 0; // x0 is hardwired to 0
+    // Sign-extend immediate value to 32 bits
+    static int32_t signExtend(uint32_t value, int bits) {
+        uint32_t mask = 1u << (bits - 1);
+        return int32_t((value ^ mask) - mask);
     }
 
-    void loadBinary(string filename) {
+    // Load a 32-bit word from memory (little-endian)
+    uint32_t load32(uint32_t addr) {
+        if (addr + 3 >= MEM_SIZE) {
+            cerr << "Load address out of range: 0x" << hex << addr << dec << "\n";
+            running = false;
+            return 0;
+        }
+        return uint32_t(memory[addr]) |
+               (uint32_t(memory[addr + 1]) << 8) |
+               (uint32_t(memory[addr + 2]) << 16) |
+               (uint32_t(memory[addr + 3]) << 24);
+    }
+
+    // Store a 32-bit word to memory (little-endian)
+    // if value matches MMIO_PRINT address, print it instead of storing
+    void store32(uint32_t addr, uint32_t value) {
+        if (addr == MMIO_PRINT) {
+            cout << "[MMIO] " << dec << value << "\n";
+            return;
+        }
+
+        if (addr + 3 >= MEM_SIZE) {
+            cerr << "Store address out of range: 0x" << hex << addr << dec << "\n";
+            running = false;
+            return;
+        }
+
+        memory[addr]     = value & 0xFF;
+        memory[addr + 1] = (value >> 8) & 0xFF;
+        memory[addr + 2] = (value >> 16) & 0xFF;
+        memory[addr + 3] = (value >> 24) & 0xFF;
+    }
+
+public:
+    // Load binary program into memory
+    void loadBinary(const string& filename) {
         ifstream file(filename, ios::binary);
         if (!file) {
-            cerr << "Error: Could not open file " << filename << endl;
+            cerr << "Error: Could not open file " << filename << "\n";
             exit(1);
         }
         file.read(reinterpret_cast<char*>(memory), MEM_SIZE);
     }
 
-    // --- ARITHMETIC LOGIC UNIT (ALU) ---
+    // Simple ALU function for supported operations
     uint32_t ALU(uint32_t a, uint32_t b, uint8_t funct3, uint8_t funct7, uint8_t opcode) {
-        if (opcode == 0x33) { // R-Type
-            if (funct3 == 0x0 && funct7 == 0x00) return a + b; // ADD
-            if (funct3 == 0x0 && funct7 == 0x20) return a - b; // SUB
-            if (funct3 == 0x7) return a & b;                   // AND
-            if (funct3 == 0x6) return a | b;                   // OR
-        } 
-        if (opcode == 0x13) { // I-Type (ADDI)
+        if (opcode == 0x33) {
+            if (funct3 == 0x0 && funct7 == 0x00) return a + b;
+            if (funct3 == 0x0 && funct7 == 0x20) return a - b;
+        }
+        if (opcode == 0x13) {
             if (funct3 == 0x0) return a + b;
         }
         return 0;
     }
 
-    // --- CONTROL UNIT & EXECUTION ---
+    // Execute one instruction at the current PC
     void step() {
-        // 1. FETCH
-        if (pc + 4 > MEM_SIZE) { running = false; return; }
-        uint32_t instr = *reinterpret_cast<uint32_t*>(&memory[pc]);
+        if (pc + 3 >= MEM_SIZE) {
+            running = false;
+            return;
+        }
 
-        // 2. DECODE (Extracting fields per RISC-V spec)
+        uint32_t instr = load32(pc);
+        if (!running) return;
+
+        // Treat all-zero memory after the program as halt.
+        if (instr == 0) {
+            running = false;
+            return;
+        }
+
+        // Decode instruction fields
         uint8_t opcode = instr & 0x7F;
         uint8_t rd     = (instr >> 7) & 0x1F;
         uint8_t funct3 = (instr >> 12) & 0x07;
         uint8_t rs1    = (instr >> 15) & 0x1F;
         uint8_t rs2    = (instr >> 20) & 0x1F;
         uint8_t funct7 = (instr >> 25) & 0x7F;
-
         uint32_t next_pc = pc + 4;
 
-        // 3. EXECUTE (Control Unit logic)
         switch (opcode) {
-            case 0x33: { // R-Type
+            case 0x33: { // R-type: add/sub
                 regs[rd] = ALU(regs[rs1], regs[rs2], funct3, funct7, opcode);
                 break;
             }
-            case 0x13: { // I-Type (ADDI)
-                int32_t imm = (int32_t(instr) >> 20); // Sign-extended 12-bit
-                regs[rd] = ALU(regs[rs1], imm, funct3, 0, opcode);
+
+            case 0x13: { // addi
+                int32_t imm = signExtend(instr >> 20, 12);
+                regs[rd] = ALU(regs[rs1], uint32_t(imm), funct3, 0, opcode);
                 break;
             }
-            case 0x03: { // Load Word (LW)
-                int32_t imm = (int32_t(instr) >> 20);
+
+            case 0x03: { // lw
+                if (funct3 != 0x2) { running = false; break; }
+                int32_t imm = signExtend(instr >> 20, 12);
                 uint32_t addr = regs[rs1] + imm;
-                regs[rd] = *reinterpret_cast<uint32_t*>(&memory[addr]);
+                regs[rd] = load32(addr);
                 break;
             }
-            case 0x23: { // Store Word (SW)
-                int32_t imm = ((instr >> 7) & 0x1F) | ((instr >> 25) << 5);
-                if (imm & 0x800) imm |= 0xFFFFF000; // Manual sign extend
+
+            case 0x23: { // sw
+                if (funct3 != 0x2) { running = false; break; }
+                uint32_t imm_raw = ((instr >> 7) & 0x1F) | (((instr >> 25) & 0x7F) << 5);
+                int32_t imm = signExtend(imm_raw, 12);
                 uint32_t addr = regs[rs1] + imm;
-                
-                // Memory Mapped IO Check
-                if (addr == MMIO_PRINT) {
-                    cout << (char)regs[rs2] << flush;
-                } else {
-                    *reinterpret_cast<uint32_t*>(&memory[addr]) = regs[rs2];
+                store32(addr, regs[rs2]);
+                break;
+            }
+
+            case 0x63: { // beq
+                uint32_t imm_raw = (((instr >> 31) & 0x1) << 12) |
+                                   (((instr >> 7)  & 0x1) << 11) |
+                                   (((instr >> 25) & 0x3F) << 5) |
+                                   (((instr >> 8)  & 0xF) << 1);
+                int32_t imm = signExtend(imm_raw, 13);
+                if (funct3 == 0x0 && regs[rs1] == regs[rs2]) {
+                    next_pc = pc + imm;
                 }
                 break;
             }
-            case 0x63: { // B-Type (BEQ)
-                int32_t imm = ((instr >> 7) & 0x1E) | ((instr >> 20) & 0x7E0) | 
-                              ((instr << 4) & 0x800) | ((instr >> 19) & 0x1000);
-                if (imm & 0x1000) imm |= 0xFFFFE000;
-                
-                if (funct3 == 0x0 && regs[rs1] == regs[rs2]) next_pc = pc + imm;
-                break;
-            }
-            case 0x6F: { // J-Type (JAL)
-                int32_t imm = ((instr >> 21) & 0x3FF) << 1 | ((instr >> 20) & 0x1) << 11 |
-                              ((instr >> 12) & 0xFF) << 12 | (int32_t(instr) >> 31) << 20;
+
+            case 0x6F: { // jal
+                uint32_t imm_raw = (((instr >> 31) & 0x1) << 20) |
+                                   (((instr >> 12) & 0xFF) << 12) |
+                                   (((instr >> 20) & 0x1) << 11) |
+                                   (((instr >> 21) & 0x3FF) << 1);
+                int32_t imm = signExtend(imm_raw, 21);
                 regs[rd] = pc + 4;
                 next_pc = pc + imm;
                 break;
             }
+
+            case 0x67: { // jalr
+                if (funct3 != 0x0) { running = false; break; }
+                int32_t imm = signExtend(instr >> 20, 12);
+                uint32_t return_addr = pc + 4;
+                next_pc = (regs[rs1] + imm) & ~1u;
+                regs[rd] = return_addr;
+                break;
+            }
+
             default:
                 running = false;
                 break;
         }
 
-        regs[0] = 0; // Ensure x0 is always zero
+        regs[0] = 0;
         pc = next_pc;
     }
 
+    // CPU run loop
     void run() {
-        while (running) {
-            step();
-        }
+        while (running) step();
     }
 
-    // --- MEMORY DUMP ---
-    void dumpState() {
-        cout << "\n--- CPU State Dump ---" << endl;
-        cout << "PC: 0x" << hex << pc << endl;
+    // Dump CPU state (for debugging)
+    void dumpState() const {
+        cout << "\n--- CPU State Dump ---\n";
+        cout << "PC: 0x" << hex << pc << dec << "\n";
         for (int i = 0; i < 32; i++) {
             cout << "x" << dec << i << ": 0x" << hex << regs[i] << "  ";
-            if ((i + 1) % 4 == 0) cout << endl;
+            if ((i + 1) % 4 == 0) cout << "\n";
         }
+        cout << dec;
     }
 };
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        cout << "Usage: " << argv << " <binary_file>" << endl;
+        cout << "Usage: " << argv[0] << " <binary_file>\n";
         return 1;
     }
 
@@ -142,6 +219,5 @@ int main(int argc, char* argv[]) {
     myCPU.loadBinary(argv[1]);
     myCPU.run();
     myCPU.dumpState();
-
     return 0;
 }
