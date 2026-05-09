@@ -13,6 +13,7 @@
 //   - byte-addressable memory
 //   - Stack support for recursion
 //   - MMIO output support
+//   - optional character and verbose modes [-c] [-v]
 //
 // Memory:
 //   64KB total memory
@@ -34,6 +35,15 @@ private:
     uint32_t pc = 0;
     uint8_t memory[MEM_SIZE] = {0};
     bool running = true;
+    bool char_mode = false; // If true, print as char instead of number
+    bool verbose_mode = false;   // If true, print instruction trace
+
+    // Helper function for verbose tracing
+    void verbose(const string& msg) {
+        if (verbose_mode) {
+            cout << msg << "\n";
+        }
+    }
 
     // Sign-extend immediate value to 32 bits
     static int32_t signExtend(uint32_t value, int bits) {
@@ -58,7 +68,11 @@ private:
     // if value matches MMIO_PRINT address, print it instead of storing
     void store32(uint32_t addr, uint32_t value) {
         if (addr == MMIO_PRINT) {
-            cout << "[MMIO] " << dec << value << "\n";
+            if (char_mode) {
+                cout << char(value & 0xFF) << flush;
+            } else {
+                cout << "[MMIO] " << dec << value << "\n";
+            }
             return;
         }
 
@@ -75,6 +89,10 @@ private:
     }
 
 public:
+    // Constructor with optional modes
+    RISCV_CPU(bool char_mode = false, bool verbose_mode = false) 
+        : char_mode(char_mode), verbose_mode(verbose_mode) {}
+
     // Load binary program into memory
     void loadBinary(const string& filename) {
         ifstream file(filename, ios::binary);
@@ -104,8 +122,15 @@ public:
             return;
         }
 
+        // fetch instruction
         uint32_t instr = load32(pc);
         if (!running) return;
+
+        if(verbose_mode) {
+            cout << "\n[FETCH] PC=0x" << hex << pc
+            << " INSTR=0x" << setw(8) << setfill('0') << instr 
+            << setfill(' ') << dec << "\n";
+        }
 
         // Treat all-zero memory after the program as halt.
         if (instr == 0) {
@@ -122,15 +147,37 @@ public:
         uint8_t funct7 = (instr >> 25) & 0x7F;
         uint32_t next_pc = pc + 4;
 
+        if (verbose_mode) {
+            cout << "[DECODE] opcode=0x" << hex << int(opcode)
+            << " rd=x" << dec << int(rd)
+            << " rs1=x" << int(rs1)
+            << " rs2=x" << int(rs2)
+            << " funct3=0x" << hex << int(funct3)
+            << " funct7=0x" << int(funct7)
+            << dec << "\n";
+        }
+
         switch (opcode) {
             case 0x33: { // R-type: add/sub
                 regs[rd] = ALU(regs[rs1], regs[rs2], funct3, funct7, opcode);
+                if (verbose_mode) {
+                    cout << "[COMPUTE] R-type x" << int(rd)
+                    << " = x" << int(rs1)
+                    << " op x" << int(rs2)
+                    << " -> " << regs[rd] << "\n";
+                }
                 break;
             }
 
             case 0x13: { // addi
                 int32_t imm = signExtend(instr >> 20, 12);
                 regs[rd] = ALU(regs[rs1], uint32_t(imm), funct3, 0, opcode);
+                if (verbose_mode) {
+                    cout << "[COMPUTE] I-type x" << int(rd)
+                    << " = x" << int(rs1)
+                    << " op " << imm
+                    << " -> " << regs[rd] << "\n";
+                }
                 break;
             }
 
@@ -139,6 +186,11 @@ public:
                 int32_t imm = signExtend(instr >> 20, 12);
                 uint32_t addr = regs[rs1] + imm;
                 regs[rd] = load32(addr);
+                if (verbose_mode) {
+                    cout << "[STORE] lw loaded memory[0x" << hex << addr
+                    << "] into x" << dec << int(rd)
+                    << " = " << regs[rd] << "\n";
+                }
                 break;
             }
 
@@ -147,7 +199,12 @@ public:
                 uint32_t imm_raw = ((instr >> 7) & 0x1F) | (((instr >> 25) & 0x7F) << 5);
                 int32_t imm = signExtend(imm_raw, 12);
                 uint32_t addr = regs[rs1] + imm;
-                store32(addr, regs[rs2]);
+                if (verbose_mode) {
+                    cout << "[STORE] sw x" << int(rs2)
+                    << " value=" << regs[rs2]
+                    << " to memory/MMIO[0x" << hex << addr << dec << "]\n";
+                }
+                store32(addr, regs[rs2]);     
                 break;
             }
 
@@ -160,6 +217,12 @@ public:
                 if (funct3 == 0x0 && regs[rs1] == regs[rs2]) {
                     next_pc = pc + imm;
                 }
+                if (verbose_mode) {
+                    cout << "[COMPUTE] beq x" << int(rs1)
+                    << " == x" << int(rs2)
+                    << " ? " << (regs[rs1] == regs[rs2] ? "taken" : "not taken")
+                    << "\n";
+                }
                 break;
             }
 
@@ -171,6 +234,11 @@ public:
                 int32_t imm = signExtend(imm_raw, 21);
                 regs[rd] = pc + 4;
                 next_pc = pc + imm;
+                if (verbose_mode) {
+                    cout << "[COMPUTE] jal: x" << int(rd)
+                    << " = return address 0x" << hex << regs[rd]
+                    << ", next PC=0x" << next_pc << dec << "\n";
+                }
                 break;
             }
 
@@ -180,6 +248,11 @@ public:
                 uint32_t return_addr = pc + 4;
                 next_pc = (regs[rs1] + imm) & ~1u;
                 regs[rd] = return_addr;
+                if (verbose_mode) {
+                    cout << "[COMPUTE] jalr: x" << int(rd)
+                    << " = return address 0x" << hex << return_addr
+                    << ", next PC=0x" << next_pc << dec << "\n";
+                }
                 break;
             }
 
@@ -211,11 +284,30 @@ public:
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        cout << "Usage: " << argv[0] << " <binary_file>\n";
+        cout << "Usage: " << argv[0] << " <binary_file> [-c]\n";
         return 1;
     }
 
-    RISCV_CPU myCPU;
+    bool char_mode = false;
+    bool verbose_mode = false;
+
+    // optional -c/-v flag
+    for (int i = 2; i < argc; i++) {
+        string arg = argv[i];
+
+        if (arg == "-c") {
+            char_mode = true;
+        } else if (arg == "-v") {
+            verbose_mode = true;
+        } else {
+            cerr << "Unknown option: " << arg << "\n";
+            cout << "Usage: " << argv[0] << " <binary_file> [-c] [-v]\n";
+            return 1;
+        }
+    }
+
+
+    RISCV_CPU myCPU(char_mode, verbose_mode);
     myCPU.loadBinary(argv[1]);
     myCPU.run();
     myCPU.dumpState();
